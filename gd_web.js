@@ -52,47 +52,68 @@ Module["expectedDataFileDownloads"]++;
     var REMOTE_PACKAGE_BASE = "gd_web.data";
     var REMOTE_PACKAGE_NAME = Module["locateFile"]?.(REMOTE_PACKAGE_BASE, "") ?? REMOTE_PACKAGE_BASE;
     var REMOTE_PACKAGE_SIZE = metadata["remote_package_size"];
-    async function fetchRemotePackage(packageName, packageSize) {
+async function fetchRemotePackage(packageName, packageSize) {
       if (isNode) {
         var fsPromises = require("fs/promises");
         var contents = await fsPromises.readFile(packageName);
         return contents.buffer;
       }
       Module["dataFileDownloads"] ??= {};
-      try {
-        var response = await fetch(packageName);
-      } catch (e) {
-        throw new Error(`Network Error: ${packageName}`, {
-          e
-        });
-      }
-      if (!response.ok) {
-        throw new Error(`${response.status}: ${response.url}`);
-      }
+
+      const PART_COUNT = 16;
       const chunks = [];
-      const headers = response.headers;
-      const total = Number(headers.get("Content-Length") ?? packageSize);
       let loaded = 0;
+      const total = packageSize || 314500859;
       Module["setStatus"]?.("Downloading data...");
-      const reader = response.body.getReader();
-      while (1) {
-        var {done, value} = await reader.read();
-        if (done) break;
-        chunks.push(value);
-        loaded += value.length;
+
+      // Download all 16 parts with retry protection against CDN rate-limits
+      for (let i = 1; i <= PART_COUNT; i++) {
+        const partUrl = `${packageName}.part${i}`;
+        let res;
+
+        for (let attempt = 1; attempt <= 3; attempt++) {
+          try {
+            res = await fetch(partUrl);
+            // If jsDelivr/CDN temporarily rate-limits (403/429), retry with query string
+            if (!res.ok && (res.status === 403 || res.status === 429)) {
+              await new Promise(r => setTimeout(r, 400 * attempt));
+              res = await fetch(`${partUrl}?t=${Date.now()}`);
+            }
+            if (res.ok) break;
+          } catch (e) {
+            if (attempt === 3) throw new Error(`Network Error: ${partUrl}`);
+            await new Promise(r => setTimeout(r, 400 * attempt));
+          }
+        }
+
+        if (!res || !res.ok) {
+          throw new Error(`Failed to load chunk ${res?.status || 404}: ${partUrl}`);
+        }
+
+        const buf = await res.arrayBuffer();
+        const u8 = new Uint8Array(buf);
+        chunks.push(u8);
+        loaded += u8.byteLength;
+
         Module["dataFileDownloads"][packageName] = {
-          loaded,
-          total
+          loaded: loaded,
+          total: total
         };
+
         let totalLoaded = 0;
         let totalSize = 0;
         for (const download of Object.values(Module["dataFileDownloads"])) {
           totalLoaded += download.loaded;
           totalSize += download.total;
         }
-        Module["setStatus"]?.(`Downloading data... (${totalLoaded}/${totalSize})`);
+        Module["setStatus"]?.(`Downloading data... (${(totalLoaded / 1048576).toFixed(1)}MB / ${(totalSize / 1048576).toFixed(1)}MB)`);
+
+        // Brief 60ms breather to prevent Cloudflare/jsDelivr connection drops
+        await new Promise(r => setTimeout(r, 60));
       }
-      const packageData = new Uint8Array(chunks.map(c => c.length).reduce((a, b) => a + b, 0));
+
+      // Reassemble the 16 parts into the single virtual data package
+      const packageData = new Uint8Array(loaded);
       let offset = 0;
       for (const chunk of chunks) {
         packageData.set(chunk, offset);
